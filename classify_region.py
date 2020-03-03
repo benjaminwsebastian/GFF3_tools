@@ -18,6 +18,11 @@ CHROM_LEGEND = {
     "GK000074.1" : 7,
     "GK000075.1" : 8
 }
+# For the intergenic classification case:
+intergenic_tup = namedtuple("intergenic", ["start", "end", "name"])
+default = {"start": None, "end": None, "name": None} 
+intergenic = intergenic_tup(**default)
+
 # endregion
 
 
@@ -32,6 +37,7 @@ class GFFGene(object):
         self.gff_record = gff_record
         self.start = gff_record.start
         self.end = gff_record.end
+        self.length = self.end - (self.start - 1)
         self.name = parse_gff_attributes(self.gff_record.attributes)["Name"]
         self.id = parse_gff_attributes(self.gff_record.attributes)["ID"]
         self.transcripts = transcripts if isinstance(transcripts, list) else []
@@ -77,6 +83,20 @@ def parse_gff_attributes(attr_str):
 
 def create_gff_record(seq_id, source, seq_type, start, end, score, strand, phase, attributes):
     """ Create GFF record from the provided variables. """
+    start = None if start == "." else int(start)
+    end = None if end == "." else int(end)
+    if end is not None and start is not None:
+        if end < start:
+            tmp = end
+            end = start
+            start = end
+            
+    if strand == "-" or strand == "C":
+        if start is not None and end is not None:
+            tmp = end
+            end = -1*start
+            start = -1*tmp
+    
     gff_dict = {
         # if we want decoding of the URL-encoded strings we can use
         # "seq_id": None if seq_id == "." else urllib.unquote(seq_id),
@@ -84,8 +104,8 @@ def create_gff_record(seq_id, source, seq_type, start, end, score, strand, phase
         "seq_id": None if seq_id == "." else seq_id,
         "source": None if source == "." else source,
         "seq_type": None if seq_type == "." else seq_type,
-        "start": None if start == "." else int(start),
-        "end": None if end == "." else int(end),
+        "start": start,
+        "end": end,
         "score": None if score == "." else float(score),
         "strand": None if strand == "." else strand,
         "phase": None if phase == "." else phase,
@@ -149,10 +169,11 @@ def read_gff(gff_in, params):
     :type gff_in: file
     """
     genes = {
-        "+" : [],
-        "-" : []
+        "+" : {},
+        "-" : {}
     }
     
+    starts = {"+" : [] , "-" : []}
     gff_record = None
     # parse lines
     for line in gff_in:
@@ -166,108 +187,267 @@ def read_gff(gff_in, params):
                 # add to appropriate list and filter on chromosome
                 if gene is not None and gene.gff_record.seq_id == params["chrom"]:
                     if gene.gff_record.strand == "+":
-                        genes["+"].append(gene)
+                        genes["+"][gene.start] = gene
+                        starts["+"].append(gene.start)
                     else:
-                        genes["-"].append(gene)
-                    
-    return genes
+                        genes["-"][gene.start] = gene
+                        starts["-"].append(gene.start)
+    starts["+"].sort()
+    starts["-"].sort()
+    
+    return genes, starts
 
 ## End reading GFF functions
 
 ## Begin classifying regions functions ##
 
-def check_start(genes, sample):
-    closest_gene = (None, 10000000)
-        
-    for gene in genes[sample["Sense"]]:
-        diff = sample["Beg"] - gene.start
-            
-        if diff < closest_gene[1] and diff >= 0: # Check if it could be in a gene
-            closest_gene = (gene, diff)
-            
-    return closest_gene
+def get_coverage(region, TE):
+    len_te = abs(TE["End"] - TE["Beg"])
+    post, pre = 0, 0
+    if TE["End"] > region.end:
+        post = abs(TE["End"] - region.end)
+    if TE["Beg"] < region.start:
+        pre = abs(region.start - TE["Beg"])
+    coverage = abs(len_te - post - pre)/abs(region.end - region.start)
+    return coverage
 
-def check_end(genes, sample):
-    closest_gene = (None, 10000000)
-       
-    for gene in genes[sample["Sense"]]:
-        diff = sample["End"] - gene.start
-        
-        if diff < closest_gene[1] and diff >= 0: # check if it could be in a gene
-            closest_gene = (gene, diff)
-            
-    return closest_gene
-
-def where_in_gene(gene, sample):
-    closest_region_beg = (None, 10000000)
-    for region in gene.regions:
-        diff = sample["Beg"] - region.start
-            
-        if diff <= closest_region_beg[1] and diff >= 0:
-            closest_region_beg = (region, diff)
+def add_region(classified_regions, gene, TE, region_type, region_coverage, **kwargs):
+    region_start, region_end, gene_start, gene_end = None, None, None, None
+    try:
+        region_start = min(abs(kwargs["region_start"]), abs(kwargs["region_end"]))
+        region_end = max(abs(kwargs["region_start"]), abs(kwargs["region_end"]))
+    except:
+        pass
     
-    closest_region_end = (None, 10000000)
-    for region in gene.regions:
-        diff = region.end - sample["End"]
-            
-        if diff <= closest_region_end[1] and diff >= 0:
-            closest_region_end = (region, diff)
-
-    if closest_region_beg[0] is not None and closest_region_end[0] is not None:
-        if closest_region_beg[0].start == closest_region_end[0].start:
-            return closest_region_beg[0].seq_type + ',' + gene.name
+    try:
+        gene_start = min(abs(gene.start), abs(gene.end))
+        gene_end = max(abs(gene.start), abs(gene.end))
+    except:
+        pass
+    
+    TE_beg = min(abs(TE["Beg"]), abs(TE["End"]))
+    TE_end = max(abs(TE["Beg"]), abs(TE["End"]))
+    
+    classified_regions = classified_regions.append({
+        "Gene ID": gene.name,
+        "Sense": TE["Sense"],
+        "Gene start": gene_start if gene.start is not None else None,
+        "Gene end": gene_end if gene.end is not None else None,
+        "Region type": region_type,
+        "Region start": region_start if region_start is not None else None,
+        "Region end": region_end if region_end is not None else None,
+        "TE ID": TE["ID"],
+        "TE family": TE["Family"],
+        "TE start": TE_beg,
+        "TE stop": TE_end,
+        "Region coverage": round(abs(region_coverage), 4)
+    }, ignore_index = True)
+               
+    return classified_regions
+               
+def add_promoter(classified_regions, right_start, genes, TE, params):
+    # Calculate percent of promoter region covered by the TE
+    # The promoter region coverage is the length of the TE within the given promoter region length (default 1000) dividied by the given promoter region length
+    start_of_promoter = genes[TE["Sense"]][right_start].start - params["promoter"]
+    post, pre = 0, 0
+    if TE["End"] > genes[TE["Sense"]][right_start].start:
+        post =  abs(TE["End"] - genes[TE["Sense"]][right_start].start)
+    if TE["Beg"] < start_of_promoter:
+        pre = abs(start_of_promoter - TE["Beg"])
+    len_in_prom = abs(TE["End"] - TE["Beg"]) - post - pre
+    coverage = len_in_prom / params["promoter"]
+    
+    # Is the TE in the area before the start of the promoter region?
+    pre_promoter = False
+    if TE["Beg"] < start_of_promoter:
+        pre_promoter = True
+        
+    # Add the intergenic region before the start of the promoter region that the TE covers
+    if pre_promoter:
+        classified_regions = add_region(classified_regions, intergenic, TE, "Intergenic", 1, region_start = TE["Beg"], region_end = abs(start_of_promoter-1))
+    classified_regions = add_region(classified_regions, genes[TE["Sense"]][right_start], TE, "Promoter", coverage, region_start = start_of_promoter, region_end = genes[TE["Sense"]][right_start].start)
+    
+    return classified_regions
+    
+def where_in_genes(left_start, right_start, starts, genes, TE, classified_regions, params):
+    # Define starting point - does the current point begin in a gene or does TE end after the beginning of the next gene (exclusive "or" used)
+    covered_genes = []
+    already_classified = False
+    if left_start is not None and left_start + genes[TE["Sense"]][left_start].length > TE["Beg"]:
+        # LEFT OVERLAP start
+        already_classified = True
+        covered_genes.append(left_start)
+        
+    if right_start is not None and TE["End"] > genes[TE["Sense"]][right_start].start:
+        # RIGHT OVERLAP start
+        
+        if not already_classified:
+            # It must be the case that the gene starts in the promoter region - or crosses through it - before entering a downstream (with respect to sense) gene
+            classified_regions = add_promoter(classified_regions, right_start, genes, TE, params)
+        
+        already_classified = True
+        covered_genes.append(right_start)
+        
+    if not already_classified:
+        # This case, the gene must be intergenic or just in a promoter region
+        return classified_regions, already_classified
+    
+    all_genes_found = False
+    while not all_genes_found:
+        # Get the location of the next nearest upstream gene
+        try:
+            right_start = min([x for x in starts[TE["Sense"]] if x > right_start])
+        except:
+            pass
+        
+        if right_start is not None and TE["End"] > genes[TE["Sense"]][right_start].start:
+            covered_genes.append(right_start)
         else:
-            return closest_region_beg[0].seq_type + ',' + closest_region_end[0].seq_type + ',' + gene.name
-    elif closest_region_beg[0] is not None:
-        return closest_region_beg[0].seq_type + ',' + gene.name
-    else:
-        return closest_region_end[0].seq_type + ',' + gene.name
-        
-def classify_regions(genes, locations, params):
-    """ Classifies coordinates into regions """
-    classified_regions = []
-    for index, sample in locations.iterrows():
-        if sample["Sense"] == "C":
-            sample["Sense"] = "-"
-        
-        closest_gene_start = check_start(genes, sample)
-        closest_gene_end = check_end(genes, sample)
-        
-        if closest_gene_start[0] is not None:
-            if sample["Beg"] < closest_gene_start[0].end: # sample beg is contained in a gene
-                if sample["End"] <= closest_gene_start[0].end: # sample is entirely contained within a gene
-                    classified_regions.append(where_in_gene(closest_gene_start[0], sample))
-                    
-                elif closest_gene_end[0] is not None:
-                    if sample["End"] >= closest_gene_end[0].start and closest_gene_start[0].name != closest_gene_end[0].name: # across multiple genes
-                        classified_regions.append(where_in_gene(closest_gene_start[0], sample) + ";" + where_in_gene(closest_gene_end[0], sample)) # add areas in first and last gene (there may be genes inbetween which sample spans
-                        
-                    elif sample["Sense"] == "-": # in the promotor area and in gene
-                        classified_regions.append("Promotor region," + where_in_gene(closest_gene_start[0], sample))
-                        
-                    else: # in the gene and the 3' area (not promotor)
-                        classified_regions.append(where_in_gene(closest_gene_start[0], sample))
+            all_genes_found = True
+    
+    for gene_num, gene in enumerate(covered_genes):
+        gene = genes[TE["Sense"]][gene]
+        regions = {}
+        region_starts = []
             
-            elif closest_gene_end[0] is not None:
-                if sample["End"] < closest_gene_end[0].end: # sample beg not contained in gene
-                    if sample["Sense"] == "+":
-                        classified_regions.append("Promotor region," + where_in_gene(closest_gene_end[0], sample)) # end contained in gene and beg in promotor region
-                    else:
-                        classified_regions.append(where_in_gene(closest_gene_end[0], sample)) # end contained in gene and beg not in promotor region
-                        
-                elif (abs(sample["Beg"] - closest_gene_start[0].start) < params["promotor"] or abs(sample["End"] - closest_gene_start[0].start) < params["promotor"]) and sample["Sense"] == "+": # beg and end to the left of a gene in the promotor region
-                    classified_regions.append("Promotor region," + closest_gene_start[0].name)
-                    
-                elif (abs(sample["End"] - closest_gene_end[0].end) < params["promotor"] or abs(sample["Beg"] - closest_gene_end[0].end) < params["promotor"]) and sample["Sense"] == "-": # beg and end to the right of a gene and in the promotor region
-                    classified_regions.append("Promotor region," + closest_gene_end[0].name)
-                    
-                else: # intergenic
-                    classified_regions.append("intergenic")
-                    
-        else: # intergenic
-             classified_regions.append("intergenic")
+        for region in gene.regions:
+            if region.seq_type.upper() not in ("CDS",):
+                regions[region.start] = region
+                region_starts.append(region.start)
+                
+        region_starts.sort()
+        covered_regions = []
+        try:
+            covered_regions = [x for x in region_starts if x > TE["Beg"] and x < TE["End"]]
+        except:
+            pass
+        
+        # First add the gene and the TE, with the percent of gene covered by the TE
+        coverage = get_coverage(gene, TE)
+        classified_regions = add_region(classified_regions, gene, TE, "Gene", coverage)
+        
+        # Next add each component
+        
+        # Get the starting region
+        try:
+            left = max([x for x in region_starts if x < TE["Beg"]])
+        except:
+            left = min(region_starts) # The case where the TE begins outside of the gene
+        try:
+            i = region_starts.index(min([x for x in region_starts if x > TE["End"]])) - 1
+            right = region_starts[i]
+        except:
+            right = None
+         
+        # Add the starting region
+        coverage = get_coverage(regions[left], TE)
+        classified_regions = add_region(classified_regions, gene, TE, regions[left].seq_type, coverage, region_start = regions[left].start, region_end = regions[left].end)
+        
+        # Add the middle regions
+        try:
+            covered_regions.remove(left)
+        except:
+            pass
+        try:
+            covered_regions.remove(right)
+        except:
+            pass
+        
+        for region in covered_regions:
+            coverage = get_coverage(regions[region], TE)
+            classified_regions = add_region(classified_regions, gene, TE, regions[region].seq_type, coverage, region_start = regions[region].start, region_end = regions[region].end)
+
+            # Add the ending region
+        # If there are no covered regions, then a region is entirely covering the TE or the TE is between 2 regions
+        if left != right and right is not None:
+            coverage = get_coverage(regions[right], TE)
+            classified_regions = add_region(classified_regions, gene, TE, regions[right].seq_type, coverage, region_start = regions[right].start, region_end = regions[right].end)
+
+        # Ending of TE is outside of the gene
+        elif right is None:
+            # Not in promoter region of next gene
+            if gene_num == len(covered_genes) - 1:
+                classified_regions = add_region(classified_regions, intergenic, TE, "Intergenic", 1)
+                
+            # In promoter region of next gene
+            elif abs(genes[TE["Sense"]][covered_genes[gene_num + 1]].start - TE["End"]) < params["promoter"]:
+                classified_regions = add_promoter(classified_regions, genes[TE["Sense"]][covered_genes[gene_num + 1]].start, genes, TE, params)        
+        
+    return classified_regions, already_classified
+    
+def classify_regions(genes, starts, TEs, params):
+    """ Classifies coordinates into regions """
+    
+    # Columns for output file
+    columns = [
+        "Gene ID",
+        "Sense",
+        "Gene start",
+        "Gene end",
+        "Region type",
+        "Region start",
+        "Region end",
+        "TE ID",
+        "TE family",
+        "TE start",
+        "TE stop",
+        "Region coverage"
+    ]
+    classified_regions = pd.DataFrame(columns = columns)
+    for index, TE in TEs.iterrows():
+        if TE["Sense"] == "C":
+            TE["Sense"] = "-"
+        if TE["Sense"] == "-":
+            tmp = -1*TE["Beg"]
+            TE["Beg"] = -1*TE["End"]
+            TE["End"] = tmp
+        
+        right_start = None
+        left_start = None
+        
+        # Get the location of the nearest upstream and downstream genes to the start of the TE
+        try:
+            right_start = min([x for x in starts[TE["Sense"]] if x > TE["Beg"]])
+        except:
+            pass
+        try:
+            left_start = max([x for x in starts[TE["Sense"]] if x < TE["Beg"]])
+        except:
+            pass
+
+        classified_regions, already_classified = where_in_genes(left_start, right_start, starts, genes, TE, classified_regions, params) 
+        
+        if not already_classified and right_start is not None and genes[TE["Sense"]][right_start].start - TE["End"] < params["promoter"]:
+            # PROMOTER REGION - The TE is just in the promoter region
+            already_classified = True
+            
+            # Need to classify intergenic region before promoter
+            classified_regions = add_promoter(classified_regions, right_start, genes, TE, params)
+            
+        if not already_classified:
+            # INTERGENIC
+            
+            classified_regions = add_region(classified_regions, intergenic, TE, "Intergenic", 1)
     return classified_regions
         
+# End classifying regions section
+
+# Begin post processing section
+
+def mark_regions(classified_regions):
+    for region in ("exon", "intron", "five_prime_utr", "three_prime_utr"):
+        
+        current_region = classified_regions[classified_regions["Region type"] == region].copy()
+        grouped_regions = current_region.groupby(["Region start"])
+        
+        for i, group in enumerate(grouped_regions):
+            for index in group[1].index:
+                classified_regions.iloc[index]["Region type"] = region + str(i)
+            
+    return classified_regions
+
+# End post processing section
+
 ###########
 ## INPUT ##
 ###########
@@ -300,23 +480,29 @@ def get_args():
 
 def main(gff_in, csv_file_name, params):
     
-    genes = read_gff(gff_in, params)
-    locations = pd.read_csv(csv_file_name, sep=params["sep"])
+    print("Reading in gff file...")
+    genes, starts = read_gff(gff_in, params)
+    print("Reading in TE file...")
+    TEs = pd.read_csv(csv_file_name, sep=params["sep"])
     
     # remove rows that don't begin with "###"
-    locations = locations[locations['Score'].str.contains("###")]
+    TEs = TEs[TEs['Score'].str.contains("###")]
     
     # rename columns so they work with python
-    locations.columns = ['Score', '%_Div', '%_Del', '%_Ins', 'Query', 'Beg', 'End',
+    TEs.columns = ['Score', '%_Div', '%_Del', '%_Ins', 'Query', 'Beg', 'End',
        'Length', 'Sense', 'Element', 'Family', 'Pos_Repeat_Beg',
        'Pos_Repeat_End', 'Pos_Repeat_Left', 'ID', 'Num_Assembled',
        '%_of_Ref']
     
-    classified_regions = classify_regions(genes, locations, params)
+    print("Classifying regions...")
+    classified_regions = classify_regions(genes, starts, TEs, params)
+    classified_regions = classified_regions.drop_duplicates()
+    classified_regions = classified_regions.reset_index(drop = True)
     
-    locations.insert(loc=1, column='gene_region', value=classified_regions)
+    classified_regions = mark_regions(classified_regions)
     
-    locations.to_csv(params["out_file"], sep='\t')
+    print("Saving to file...", params["out_file"])
+    classified_regions.to_csv(params["out_file"], sep='\t')
     
 if __name__ == "__main__":
     args = get_args()
@@ -342,10 +528,10 @@ if __name__ == "__main__":
         sep = ',' 
     
     params = {
-        "chrom" : str(chrom),
-        "sep" : sep,
-        "promotor" : args.p,
-        "out_file" : f_out
+        "chrom": str(chrom),
+        "sep": sep,
+        "promoter": args.p,
+        "out_file": f_out
     }
     
     main(gff_input, csv_file_name, params)
